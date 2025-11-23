@@ -1,0 +1,1067 @@
+---
+title: "data mining"
+author: "Jingjing Tian"
+date: "2025-11-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r load pacakagew}
+library(tidyverse)
+library(lubridate) # Date
+library(rsample) # Split
+library(glmnet)        # LASSO
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pROC) 
+library(patchwork)
+library(ggcorrplot)
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r load the data}
+# Load Data
+netflix <- read_csv("C:/Users/JINGJING TIAN/Desktop/Netflix_full_datacsv.csv",
+                    locale = locale(encoding = "UTF-8"))
+
+skimr::skim(netflix)
+# Fix language
+netflix$original_language <- tolower(netflix$original_language)
+netflix$is_english <- ifelse(netflix$original_language == "en", 1, 0)
+
+# Fix type
+netflix$type <- tolower(netflix$type)
+
+```
+
+```{r construct the target variable}
+# Variables
+imdb_var <- "imdb_votes_used"
+tmdb_var <- "tmdb_vote_count"
+
+# Medians
+imdb_med <- median(netflix[[imdb_var]], na.rm = TRUE)
+tmdb_med <- median(netflix[[tmdb_var]], na.rm = TRUE)
+
+# Indicators
+netflix$hit_imdb <- ifelse(netflix[[imdb_var]] >= imdb_med, 1, 0)
+netflix$hit_tmdb <- ifelse(netflix[[tmdb_var]] >= tmdb_med, 1, 0)
+
+# Strict AND
+netflix$hit_combined <- ifelse(netflix$hit_imdb == 1 & netflix$hit_tmdb == 1, 1, 0)
+
+table(netflix$hit_combined)
+prop.table(table(netflix$hit_combined))
+
+
+```
+
+```{r Filter NON-ENGLISH FILMS + select predictors}
+# Filter non-English films
+df <- netflix[netflix$is_english == 0 & netflix$type == "film", ]
+
+# Select predictors
+needed_cols <- c(
+  "hit_combined",            # target
+  "runtime_min",
+  "cast_popularity_max",
+  "cast_popularity_mean",
+  "crew_popularity_max",
+  "is_ip_adaptation",
+  "genres_tmdb",
+  "keywords"
+)
+
+df <- df[, needed_cols]
+
+
+```
+
+```{r handle the saprse variable- genre }
+
+# Extract all genres
+all_genres <- df$genres_tmdb %>% str_split(",") %>% unlist() %>% trimws()
+
+# Count freq
+genre_freq <- sort(table(all_genres), decreasing = TRUE)
+top5_genres <- names(genre_freq)[1:5]
+
+top5_genres
+
+# Add dummy columns
+for (g in top5_genres) {
+  df[[paste0("genre_", g)]] <- as.integer(grepl(g, df$genres_tmdb))
+}
+
+# Remove raw genre column
+df$genres_tmdb <- NULL
+
+
+
+
+#############################################################
+# 5. Process KEYWORDS (Top 3)
+#############################################################
+all_keywords <- df$keywords %>% str_split(",") %>% unlist() %>% trimws()
+keyword_freq <- sort(table(all_keywords), decreasing = TRUE)
+
+top3_keywords <- names(keyword_freq)[1:3]
+
+# Create dummy variables
+for (k in top3_keywords) {
+  df[[paste0("kw_", k)]] <- as.integer(grepl(k, df$keywords))
+}
+
+df$keywords <- NULL   # remove original column
+
+```
+
+```{r prepare the dataset}
+
+
+numeric_vars <- df[, c("runtime_min",
+                       "cast_popularity_max",
+                       "cast_popularity_mean",
+                       "crew_popularity_max")]
+
+# correlation
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+ggcorrplot(
+  cor_matrix,
+  method = "square",
+  type = "lower",
+  lab = TRUE,
+  lab_size = 5,
+  colors = c("#440000", "#E50914", "#FFFFFF"),
+  title = "Correlation Matrix "
+) +
+  theme(
+    plot.background = element_rect(fill = "black"),
+    panel.background = element_rect(fill = "black"),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    axis.text = element_text(color = "white", size = 10),
+    plot.title = element_text(color = "white", face = "bold", size = 18)
+  )
+
+
+```
+
+```{r split the training and test 7：3 }
+
+set.seed(123)
+
+split <- initial_split(df, prop = 0.7, strata = "hit_combined")
+
+train <- training(split)
+test  <- testing(split)
+
+table(train$hit_combined)
+table(test$hit_combined)
+
+
+```
+
+```{r standard the numerical variables}
+
+
+num_cols <- c("runtime_min",
+              "cast_popularity_max",
+              "cast_popularity_mean",
+              "crew_popularity_max")
+
+# compute mean + sd on training set only
+train_means <- sapply(train[, num_cols], mean, na.rm = TRUE)
+train_sds   <- sapply(train[, num_cols], sd,  na.rm = TRUE)
+
+# apply scaling
+train[, num_cols] <- scale(train[, num_cols],
+                           center = train_means,
+                           scale  = train_sds)
+
+test[, num_cols] <- scale(test[, num_cols],
+                          center = train_means,
+                          scale  = train_sds)
+
+
+
+```
+
+```{r Baseline：logistic}
+# ---- 7. Logistic Regression ----
+
+# convert target to factor
+train$hit_combined <- factor(train$hit_combined, levels = c(0,1))
+test$hit_combined  <- factor(test$hit_combined,  levels = c(0,1))
+
+# build formula
+formula_logit <- hit_combined ~ .
+
+
+logit_model <- glm(formula_logit,
+                   data = train,
+                   family = binomial)
+
+summary(logit_model)
+
+# Predict
+logit_prob <- predict(logit_model, newdata = test, type = "response")
+logit_pred <- ifelse(logit_prob > 0.5, 1, 0)
+
+# ROC + AUC
+library(pROC)
+roc_logit <- roc(test$hit_combined, logit_prob)
+
+auc_logit <- auc(roc_logit)
+auc_logit
+
+
+```
+
+```{r Random Forest}
+
+find_best_threshold <- function(roc_obj){
+coords(roc_obj, x = "best", best.method = "youden", transpose = FALSE)$threshold
+}
+
+
+
+y_train <- train$hit_combined
+y_test <- test$hit_combined
+
+# ----------------------
+
+# Random Forest Model
+
+# ----------------------
+
+set.seed(123)
+
+rf_model <- randomForest(
+hit_combined ~ .,
+data = train,
+ntree = 500,
+mtry = floor(sqrt(ncol(train) - 1)),
+importance = TRUE
+)
+
+# Probability predictions
+
+rf_prob <- predict(rf_model, test, type = "prob")[,2]
+
+# ROC & AUC
+
+roc_rf <- roc(y_test, rf_prob)
+AUC_rf <- auc(roc_rf)
+
+# Best threshold
+
+best_t_rf <- find_best_threshold(roc_rf)
+
+# Class prediction under optimal threshold
+
+rf_pred_best <- ifelse(rf_prob > best_t_rf, 1, 0)
+
+
+
+```
+
+```{r XGBoost}
+
+# Convert y to numeric 0/1 ONLY for XGB
+y_train_xgb <- as.numeric(as.character(train$hit_combined))
+y_test_xgb  <- as.numeric(as.character(test$hit_combined))
+
+# Safety: force any non-0/1 back to 0/1
+y_train_xgb[y_train_xgb > 1] <- 1
+y_test_xgb[y_test_xgb > 1] <- 1
+
+# Convert to matrices
+train_mat <- model.matrix(hit_combined ~ ., data = train)[, -1]
+
+
+test_mat  <- model.matrix(hit_combined ~ ., data = test)[, -1]
+
+# Create DMatrix
+dtrain <- xgb.DMatrix(data = train_mat, label = y_train_xgb)
+
+dtest  <- xgb.DMatrix(data = test_mat,  label = y_test_xgb)
+
+# Parameters
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 4,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+# Train
+set.seed(123)
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  verbose = 0
+)
+
+# Predict probability
+xgb_prob <- predict(xgb_model, dtest)
+
+# ROC & AUC
+roc_xgb <- roc(y_test_xgb, xgb_prob)
+AUC_xgb <- auc(roc_xgb)
+
+# Best threshold
+
+best_t_xgb <- as.numeric(coords(roc_xgb, "best", best.method = "youden")["threshold"])
+
+
+# Class prediction under optimal threshold
+xgb_pred_best <- ifelse(xgb_prob > best_t_xgb, 1, 0)
+
+
+
+```
+
+```{r performance matrics}
+y_test_final <- as.numeric(as.character(test$hit_combined))
+
+logit_cm <- table(
+  Truth = y_test_final,
+  Pred  = logit_pred
+)
+logit_cm
+
+
+rf_cm <- table(
+  Truth = y_test_final,
+  Pred  = rf_pred_best
+)
+rf_cm
+
+xgb_cm <- table(
+  Truth = y_test_final,
+  Pred  = xgb_pred_best
+)
+xgb_cm
+
+library(yardstick)
+
+df_metrics <- tibble(
+  truth = factor(y_test_final, levels = c(0,1)),
+  logit = factor(logit_pred,      levels = c(0,1)),
+  rf    = factor(rf_pred_best,    levels = c(0,1)),
+  xgb   = factor(xgb_pred_best,   levels = c(0,1))
+)
+
+
+compute_metrics <- function(truth, pred){
+  tibble(
+    Accuracy  = accuracy_vec(truth, pred),
+    Precision = precision_vec(truth, pred, estimator = "binary"),
+    Recall    = recall_vec(truth, pred, estimator = "binary"),
+    F1        = f_meas_vec(truth, pred, estimator = "binary")
+  )
+}
+
+
+metrics_logit <- compute_metrics(df_metrics$truth, df_metrics$logit)
+metrics_rf    <- compute_metrics(df_metrics$truth, df_metrics$rf)
+metrics_xgb   <- compute_metrics(df_metrics$truth, df_metrics$xgb)
+
+
+metrics_final <- tibble(
+  Model     = c("Logistic Regression", "Random Forest", "XGBoost"),
+  Accuracy  = round(c(metrics_logit$Accuracy, metrics_rf$Accuracy, metrics_xgb$Accuracy), 3),
+  Precision = round(c(metrics_logit$Precision, metrics_rf$Precision, metrics_xgb$Precision), 3),
+  Recall    = round(c(metrics_logit$Recall, metrics_rf$Recall, metrics_xgb$Recall), 3),
+  F1        = round(c(metrics_logit$F1, metrics_rf$F1, metrics_xgb$F1), 3),
+  AUC       = round(c(auc_logit, AUC_rf, AUC_xgb), 3)
+)
+
+metrics_final
+```
+
+```{r ROC od the RF}
+library(ggplot2)
+library(pROC)
+
+# ROC object 已经有： roc_rf
+# 如果没有，重新计算： roc_rf <- roc(y_test_final, rf_prob)
+
+df_roc <- data.frame(
+  fpr = 1 - roc_rf$specificities,
+  tpr = roc_rf$sensitivities
+)
+
+ggplot(df_roc, aes(fpr, tpr)) +
+  geom_line(color = "#E50914", size = 1.2) +
+  geom_abline(linetype = "dashed", color = "gray60") +
+  labs(
+    title = "Random Forest ROC Curve",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background = element_rect(fill = "black"),
+    panel.background = element_rect(fill = "black"),
+    text = element_text(color = "white"),
+    axis.text = element_text(color = "white"),
+    panel.grid = element_line(color = "gray30")
+  ) +
+  annotate("text", x = 0.6, y = 0.1,
+           label = paste0("AUC = ", round(AUC_rf, 3)),
+           color = "white", size = 5)
+
+
+
+
+
+```
+
+```{r variables importance of the RF}
+rf_imp <- importance(rf_model) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Variable") %>% 
+  rename(Importance = MeanDecreaseGini)
+
+varImpPlot(rf_model,
+           main = "Random Forest Variable Importance",
+           col = "#E50914")
+library(ggplot2)
+library(dplyr)
+
+# 假设 df_importance = rf_imp（你上面代码里的）
+rf_imp <- rf_imp %>% arrange(Importance)
+
+
+
+ggplot(rf_imp, aes(x = Importance, 
+                   y = reorder(Variable, Importance))) +
+
+  geom_col(fill = "#E50914") +
+
+  # ----- 数值标签 -----
+  geom_text(aes(label = sprintf("%.4f", Importance)),
+            color = "white",
+            hjust = -0.1,      # 往右推，避免被裁剪
+            size = 4.5) +
+
+  # ----- 给右侧留 25% 空间，避免裁剪 -----
+  scale_x_continuous(expand = expansion(mult = c(0, 0.25))) +
+
+  # ----- 关键：不裁剪 -----
+  coord_cartesian(clip = "off") +
+
+  # ----- Netflix 风格 -----
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background  = element_rect(fill = "black", color = NA),
+    panel.background = element_rect(fill = "black", color = NA),
+    panel.grid       = element_blank(),
+
+    axis.text        = element_text(color = "white"),
+    axis.title       = element_text(color = "white", size = 14),
+    plot.title       = element_text(color = "white", face = "bold", size = 20),
+
+    # ⭐ 完全避免使用 margin()（你这里总是出错）
+    plot.margin = unit(c(10, 50, 10, 10), "pt")
+  ) +
+
+  labs(
+    title = "Random Forest Variable Importance",
+    x = "Importance",
+    y = ""
+  )
+
+
+
+
+
+```
+
+```{r XGBoost variable importtance}
+# ----- get importance -----
+xgb_imp <- xgb.importance(model = xgb_model)
+
+# only keep top 15
+xgb_imp <- xgb_imp %>% slice_max(Gain, n = 15)
+
+# ----- Netflix style plot -----
+ggplot(xgb_imp, aes(x = Gain, 
+                    y = reorder(Feature, Gain))) +
+  geom_col(fill = "#E50914") +   # Netflix Red
+  labs(
+    title = "XGBoost Feature Importance (Top 15)",
+    x = "Gain",
+    y = "Feature"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    # Netflix 黑色背景
+    plot.background = element_rect(fill = "black", color = NA),
+    panel.background = element_rect(fill = "black", color = NA),
+    panel.grid.major = element_line(color = "gray30"),
+    panel.grid.minor = element_line(color = "gray20"),
+    
+    # 白色字体（Netflix 的 UI style）
+    plot.title = element_text(color = "white", face = "bold", size = 18),
+    axis.title = element_text(color = "white"),
+    axis.text = element_text(color = "white"),
+    axis.line = element_line(color = "white")
+  )
+
+```
+
+```{r}
+
+train_xgb <- as.data.frame(train_mat)
+
+pdp_obj <- pdp::partial(
+  object = xgb_model,
+  pred.var = "runtime_min",
+  train = train_xgb,
+  grid.resolution = 120
+)
+
+pdp_df <- as.data.frame(pdp_obj)
+colnames(pdp_df) <- c("runtime_raw", "pred")
+
+
+runtime_mean <- train_means["runtime_min"]
+runtime_sd   <- train_sds["runtime_min"]
+
+pdp_df$runtime_minute <- pdp_df$runtime_raw * runtime_sd + runtime_mean
+
+
+
+pdp_df$prob <- 1 / (1 + exp(-pdp_df$pred))
+
+
+#  Optimal Zone（peak ± 1 σ）
+
+peak_index <- which.max(pdp_df$prob)
+peak_runtime <- pdp_df$runtime_minute[peak_index]
+peak_prob    <- pdp_df$prob[peak_index]
+
+
+sigma_prob <- sd(pdp_df$prob)
+
+valid_idx <- which(pdp_df$prob >= (peak_prob - sigma_prob))
+
+
+runs <- split(valid_idx, cumsum(c(1, diff(valid_idx)) != 1))
+
+peak_run_id <- which(sapply(runs, function(x) peak_index %in% x))
+peak_run <- runs[[peak_run_id]]
+
+opt_start <- min(pdp_df$runtime_minute[peak_run])
+opt_end   <- max(pdp_df$runtime_minute[peak_run])
+
+
+
+
+ggplot(pdp_df, aes(runtime_minute, prob)) +
+  geom_line(color="#E50914", size=1.4) +
+  geom_vline(xintercept=c(opt_start, opt_end),
+             linetype="dashed", color="gray70") +
+  annotate("text",
+           x=(opt_start + opt_end)/2,
+           y=max(pdp_df$prob) + 0.01,
+           label=paste0("Optimal Zone (", round(opt_start), "–", round(opt_end), " min)"),
+           color="white", size=6, fontface="bold") +
+  labs(
+    title="Runtime Influence on Hit Probability",
+    x="Runtime (minutes)",
+    y="Predicted Probability"
+  ) +
+  theme_minimal(base_size=15) +
+  theme(
+    plot.background=element_rect(fill="black"),
+    panel.background=element_rect(fill="black"),
+    axis.text=element_text(color="white"),
+    axis.title=element_text(color="white"),
+    plot.title=element_text(color="white", face="bold")
+  )
+
+
+```
+
+####################################################################################### 
+
+##### Regreesiin model for the quality
+
+```{r Prepare the data }
+
+
+# ---- 1.1 top 5 genres ----
+all_genres <- netflix$genres_tmdb %>% 
+  str_split(",") %>% unlist() %>% trimws()
+
+genre_freq <- sort(table(all_genres), decreasing = TRUE)
+top5_genres <- names(genre_freq)[1]
+
+# ---- 1.2 dummy variables ----
+for (g in top5_genres) {
+  netflix[[paste0("genre_", g)]] <- as.integer(grepl(g, netflix$genres_tmdb))
+}
+
+netflix$genres_tmdb <- NULL
+
+
+
+
+df_quality <- netflix %>% 
+  filter(is_english == 0, type == "film")
+
+
+quality_vars <- c(
+  "imdb_rating_used",
+  "tmdb_vote_average",
+  "runtime_min",
+  "cast_popularity_max",
+  "cast_popularity_mean",
+  "crew_popularity_max",
+  "is_ip_adaptation"
+)
+
+genre_vars <- names(df_quality)[grepl("^genre_", names(df_quality))]
+
+all_vars <- c(quality_vars, genre_vars)
+
+quality_df <- df_quality[, all_vars]
+
+
+
+quality_df$imdb_z <- as.numeric(scale(quality_df$imdb_rating_used))
+quality_df$tmdb_z <- as.numeric(scale(quality_df$tmdb_vote_average))
+
+quality_df$quality_score <- (quality_df$imdb_z + quality_df$tmdb_z) / 2
+quality_df$imdb_rating_used <- NULL
+quality_df$tmdb_vote_average <- NULL
+
+
+
+one_level_vars <- names(quality_df)[sapply(quality_df, function(x) length(unique(x)) == 1)]
+quality_df <- quality_df[, !names(quality_df) %in% one_level_vars]
+
+
+
+```
+
+```{r Train/Test Split (70/30)}
+
+quality_clean <- na.omit(quality_df)
+
+set.seed(1)
+n <- nrow(quality_clean)
+train_idx <- sample(seq_len(n), size = 0.7 * n)
+
+train_q <- quality_clean[train_idx, ]
+test_q  <- quality_clean[-train_idx, ]
+
+# predictor set（关键：删除 imdb_z, tmdb_z）
+predictors <- setdiff(names(train_q), c("quality_score", "imdb_z", "tmdb_z"))
+
+
+# 矩阵形式
+x_train <- as.matrix(train_q[, predictors])
+y_train <- train_q$quality_score
+
+x_test  <- as.matrix(test_q[, predictors])
+y_test  <- test_q$quality_score
+```
+
+```{r}
+# ---- Remove imdb_z & tmdb_z before correlation ----
+## ===========================
+## Netflix Style Correlation Heatmap
+## ===========================
+
+library(ggplot2)
+
+# 1. 选择要画的变量（删除 imdb_z, tmdb_z）
+vars <- c(
+  "quality_score",
+  "genre_Drama",
+  "is_ip_adaptation",
+  "crew_popularity_max",
+  "cast_popularity_mean",
+  "cast_popularity_max",
+  "runtime_min"
+)
+
+df_cor <- quality_clean[, vars]
+
+# 2. 计算相关矩阵
+cor_mat <- cor(df_cor, use = "complete.obs")
+
+# 3. 转为 long 格式（不用 reshape2）
+cor_df <- data.frame(
+  Var1 = rep(rownames(cor_mat), times = ncol(cor_mat)),
+  Var2 = rep(colnames(cor_mat), each = nrow(cor_mat)),
+  Correlation = as.vector(cor_mat)
+)
+
+# 4. Netflix 颜色
+netflix_colors <- c(
+  "#000000",  # black
+  "#330000",  # very dark red
+  "#660000",  # dark red
+  "#B00000",  # netflix red
+  "#FF0000"   # bright red
+)
+
+# 5. 绘图
+ggplot(cor_df, aes(Var1, Var2, fill = Correlation)) +
+  geom_tile(color = "white", size = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), color = "white", size = 4) +
+  
+  scale_fill_gradientn(colours = netflix_colors, limits = c(-1, 1)) +
+  
+  labs(
+    title = "Correlation Heatmap (Netflix Style)",
+    x = "",
+    y = "",
+    fill = "Correlation"
+  ) +
+  
+  # ======= Netflix Theme =========
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background   = element_rect(fill = "black", color = NA),
+    panel.background  = element_rect(fill = "black", color = NA),
+    legend.background = element_rect(fill = "black", color = NA),
+    legend.key        = element_rect(fill = "black", color = NA),
+    
+    axis.text.x       = element_text(color = "white", angle = 45, hjust = 1),
+    axis.text.y       = element_text(color = "white"),
+    plot.title        = element_text(color = "white", size = 20, face = "bold", hjust = 0.5),
+    
+    legend.title      = element_text(color = "white"),
+    legend.text       = element_text(color = "white")
+  )
+
+
+
+```
+
+```{r linear regression}
+lm_quality <- lm(quality_score ~ ., data = train_q[, c(predictors, "quality_score")])
+lm_pred <- predict(lm_quality, newdata = test_q)
+
+summary(lm_quality)
+
+lm_rmse <- sqrt(mean((lm_pred - y_test)^2))
+lm_mae  <- mean(abs(lm_pred - y_test))
+lm_r2   <- 1 - sum((lm_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+
+lm_result <- data.frame(
+  Model = "Linear Regression",
+  RMSE = lm_rmse, 
+  MAE = lm_mae,
+  R2 = lm_r2
+)
+
+```
+
+```{r linear regression with he elestic net }
+set.seed(1)
+elastic_model <- cv.glmnet(
+  x_train, y_train,
+  alpha = 0.5,
+  nfolds = 10
+)
+
+elastic_pred <- predict(elastic_model, newx = x_test, s = "lambda.min")
+
+elastic_rmse <- sqrt(mean((elastic_pred - y_test)^2))
+elastic_mae  <- mean(abs(elastic_pred - y_test))
+elastic_r2   <- 1 - sum((elastic_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+
+elastic_result <- data.frame(
+  Model = "Elastic Net",
+  RMSE = elastic_rmse,
+  MAE = elastic_mae,
+  R2 = elastic_r2
+)
+
+
+```
+
+```{r XGBoost}
+
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dtest  <- xgb.DMatrix(data = x_test,  label = y_test)
+
+set.seed(1)
+xgb_model <- xgboost(
+  data = dtrain,
+  max.depth = 4,
+  eta = 0.1,
+  nrounds = 200,
+  objective = "reg:squarederror",
+  verbose = 0
+)
+
+xgb_pred <- predict(xgb_model, dtest)
+
+xgb_rmse <- sqrt(mean((xgb_pred - y_test)^2))
+xgb_mae  <- mean(abs(xgb_pred - y_test))
+xgb_r2   <- 1 - sum((xgb_pred - y_test)^2) / sum((y_test - mean(y_test))^2)
+
+xgb_result <- data.frame(
+  Model = "XGBoost",
+  RMSE = xgb_rmse,
+  MAE = xgb_mae,
+  R2 = xgb_r2
+)
+
+```
+
+```{r combine the results for the 3 regression modles }
+
+library(gridExtra)
+
+results_df <- data.frame(
+ Model = c("Linear Regression", "Elastic Net", "XGBoost"),
+ RMSE = c(0.775, 0.776, 0.896),
+ R2   = c(0.145, 0.141, -0.143)
+ )
+
+# 一个函数 —— 生成单个 Netflix 卡片
+netflix_card <- function(model, rmse, mae, r2){
+
+  ggplot() +
+    theme_void() +
+    annotate("rect", xmin=0, xmax=1, ymin=0, ymax=1, fill="black") +
+
+
+    annotate("rect", xmin=0, xmax=1, ymin=0.78, ymax=0.98, fill="#E50914") +
+    annotate("text", x=0.5, y=0.88, label=model,
+             color="white", size=6, fontface="bold") +
+
+
+    annotate("text", x=0.05, y=0.60, label=paste0("RMSE: ", round(rmse,3)),
+             hjust=0, color="white", size=5) +
+    annotate("text", x=0.05, y=0.30, label=paste0("R²  : ", round(r2,3)),
+             hjust=0, color="white", size=5) +
+
+    annotate("rect", xmin=0, xmax=1, ymin=0, ymax=1, 
+             color="white", fill=NA, size=1.2) +
+
+    coord_fixed()
+}
+
+
+cards <- lapply(1:nrow(results_df), function(i){
+  netflix_card(
+    model = results_df$Model[i],
+    rmse  = as.numeric(results_df$RMSE[i]),
+    mae   = as.numeric(results_df$MAE[i]),
+    r2    = as.numeric(results_df$R2[i])
+  )
+})
+
+grid.arrange(grobs = cards, ncol = 3)
+
+```
+
+
+
+
+
+########################################################################
+### BUzz (catogorical modle)
+
+```{r prepare}
+
+df2 <- netflix[netflix$original_language != "en" & netflix$type == "film", ]
+
+# ---- 2. Construct Buzz Target ----
+df2$buzz_raw <- log1p(df2$first28d_hours_global + df2$first28d_views_global)
+
+cutoff <- quantile(df2$buzz_raw, 0.75, na.rm = TRUE)
+df2$buzz_binary <- ifelse(df2$buzz_raw >= cutoff, 1, 0)
+df2$buzz_binary <- factor(df2$buzz_binary, levels = c(0,1))
+
+# ---- 3. Collect Genre & Keyword dummy columns from your earlier code ----
+genre_cols <- grep("^genre_", names(df2), value = TRUE)
+kw_cols    <- grep("^kw_", names(df2), value = TRUE)
+
+# ---- 4. Select final model matrix ----
+buzz_features <- c(
+  "buzz_binary",
+  "runtime_min",
+  "cast_popularity_max",
+  "cast_popularity_mean",
+  "crew_popularity_max",
+  "is_ip_adaptation",
+  genre_cols,
+  kw_cols
+)
+
+df_buzz <- df2[, buzz_features]
+df_buzz <- df_buzz[complete.cases(df_buzz), ]
+
+```
+
+
+
+```{r split to training and validation set}
+set.seed(1)
+split2 <- initial_split(df_buzz, prop = 0.7, strata = "buzz_binary")
+train_b <- training(split2)
+test_b  <- testing(split2)
+```
+
+
+```{r logistic}
+logit_b <- glm(buzz_binary ~ ., data = train_b, family = binomial)
+logit_prob_b <- predict(logit_b, test_b, type="response")
+roc_logit_b <- roc(test_b$buzz_binary, logit_prob_b)
+auc_logit_b <- auc(roc_logit_b)
+
+cat("Buzz Logistic AUC =", round(auc_logit_b,3), "\n")
+
+```
+
+
+```{r RF}
+train_b$target <- factor(train_b$buzz_binary)
+test_b$target  <- factor(test_b$buzz_binary)
+
+rf_b <- randomForest(
+  target ~ .,
+  data = train_b[, !(names(train_b) %in% c("buzz_binary"))],
+  ntree = 500,
+  mtry = floor(sqrt(ncol(train_b)-1)),
+  importance = TRUE
+)
+
+rf_prob_b <- predict(rf_b, test_b, type="prob")[,2]
+roc_rf_b <- roc(test_b$target, rf_prob_b)
+auc_rf_b <- auc(roc_rf_b)
+
+cat("Buzz RF AUC =", round(auc_rf_b,3), "\n")
+```
+
+```{r XGBoots}
+# ---- remove accidental target columns ----
+bad_cols <- c(
+  "target", 
+  "buzz_binary_rf", 
+  "buzz_binary_rf1" 
+)
+
+train_b <- train_b[, !(names(train_b) %in% bad_cols)]
+test_b  <- test_b[, !(names(test_b) %in% bad_cols)]
+
+# ---- convert y ----
+y_train_b <- as.numeric(as.character(train_b$buzz_binary))
+y_test_b  <- as.numeric(as.character(test_b$buzz_binary))
+
+# ---- build matrix (safe version) ----
+train_mat_b <- model.matrix(buzz_binary ~ ., data=train_b)[, -1]
+test_mat_b  <- model.matrix(buzz_binary ~ ., data=test_b)[, -1]
+
+# ---- XGBoost ----
+dtrain_b <- xgb.DMatrix(train_mat_b, label = y_train_b)
+dtest_b  <- xgb.DMatrix(test_mat_b,  label = y_test_b)
+
+params_b <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 4,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_b <- xgb.train(
+  params = params_b,
+  data = dtrain_b,
+  nrounds = 200,
+  verbose = 0
+)
+
+xgb_prob_b <- predict(xgb_b, dtest_b)
+roc_xgb_b <- roc(y_test_b, xgb_prob_b)
+auc_xgb_b <- auc(roc_xgb_b)
+
+cat("Buzz XGBoost AUC =", round(auc_xgb_b, 3), "\n")
+
+
+```
+
+################################################
+### compare the variable effect in buzz and hit
+```{r}
+# ---- remove accidental target columns ----
+df <- data.frame(
+  Feature = rep(c("Cast", "Comedy", "Crew", "Crime", "Drama", "Romance", "Runtime"), 2),
+  Model = c(rep("Buzz", 7), rep("Hit", 7)),
+  Coef = c(
+    0.40, -1.32, 0.56, 0.98, -0.74, -0.85, -0.13,
+    0.69, -0.78, 0.51, 1.61, -0.89, 0.86, -0.01
+  )
+)
+
+df$Feature <- factor(df$Feature,
+                     levels = c("Crew", "Cast", "Comedy", "Drama", "Romance", "Crime", "Runtime"))
+
+df$Color <- ifelse(df$Coef > 0, "#E50914", "#00BFFF")
+
+
+
+netflix_theme <- theme(
+  plot.background = element_rect(fill = "black", color = NA),
+  panel.background = element_rect(fill = "black"),
+  panel.grid.major = element_line(color = "#333333", size = 0.25),
+  
+  axis.text = element_text(color = "white", size = 14, face = "bold"),
+  axis.title = element_text(color = "white", size = 16, face = "bold"),
+  
+  strip.text = element_text(color = "black", size = 18, face = "bold"),
+  
+  plot.title = element_text(color = "white", size = 24, face = "bold", hjust = 0.5),
+  plot.subtitle = element_text(color = "white", size = 16, hjust = 0.5),
+  
+  legend.position = "none"
+)
+
+
+ggplot(df, aes(x = Feature, y = Coef, fill = Color)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  scale_fill_identity() +
+  geom_hline(yintercept = 0, color = "white", linewidth = 0.6) +
+  labs(
+    title= "Buzz vs Hit: Direction of Feature Impact",
+    x = "Feature",
+    y = "Coefficient"
+  ) +
+  facet_wrap(~Model, ncol = 1) +
+  netflix_theme
+
+
+```
+
